@@ -1,434 +1,297 @@
+<!-- TodoList.svelte -->
 <script lang="ts">
-	import Button from '$lib/components/ui/Button.svelte';
-	import Card from '$lib/components/ui/Card.svelte';
-	import Checkbox from '$lib/components/ui/Checkbox.svelte';
-	import Input from '$lib/components/ui/Input.svelte';
-	import { Trash2Icon } from 'lucide-svelte';
+	import type { Task } from '$lib/server/db/schema';
+	import { Plus } from 'lucide-svelte';
+	import { getContext } from 'svelte';
+	import TodoItem from './TodoItem.svelte';
 
-	type Todo = {
-		id: string;
-		title: string;
-		done: boolean;
-		parentId: string | null;
-	};
+	const auth = getContext('auth');
 
-	type Row = {
-		todo: Todo;
-		depth: number;
-		index: number | null; // 1-based index among siblings if depth > 0
-	};
+	let tasks = $state<Task[]>([]);
+	let newTaskText = $state('');
+	let filter = $state<'all' | 'active' | 'completed'>('all');
+	let expandedTasks = $state<Set<string>>(new Set());
 
-	const KEY = 'qself.todos';
-	let todos = $state<Todo[]>([]);
-	let newTitle = $state('');
-	let filter = $state<'all' | 'active' | 'done'>('all');
-	let editing = $state<string | null>(null);
+	// Build hierarchical tree structure
+	function buildTaskTree(): Array<{ task: Task; children: Task[]; depth: number }> {
+		const taskMap = new Map(tasks.map((task) => [task.id, task]));
+		const tree: Array<{ task: Task; children: Task[]; depth: number }> = [];
 
-	// Gesture state
-	let dragId = $state<string | null>(null);
-	let startX = $state(0);
-	let startY = $state(0);
-	let dx = $state(0);
-	let swiping = $state(false);
-	const SWIPE_THRESHOLD = 64;
+		function addTaskToTree(task: Task, depth = 0): { task: Task; children: Task[]; depth: number } {
+			const children = tasks
+				.filter((t) => t.parentId === task.id)
+				.map((child) => addTaskToTree(child, depth + 1));
 
-	// Load from localStorage + migrate to parentId
-	if (typeof window !== 'undefined') {
-		const stored = localStorage.getItem(KEY);
-		if (stored) {
-			try {
-				const parsed = JSON.parse(stored) as Array<
-					Omit<Todo, 'parentId'> & { parentId?: string | null }
-				>;
-				todos = parsed.map((t) => ({
-					id: t.id,
-					title: t.title,
-					done: t.done,
-					parentId: t.parentId === undefined ? null : (t.parentId as string | null)
-				}));
-			} catch {
-				todos = [];
-			}
+			return { task, children: children.map((c) => c.task), depth };
 		}
+
+		// Get root tasks (no parent)
+		const rootTasks = tasks.filter((task) => !task.parentId);
+
+		function flattenTree(
+			nodes: Array<{ task: Task; children: Task[]; depth: number }>
+		): Array<{ task: Task; children: Task[]; depth: number }> {
+			const result: Array<{ task: Task; children: Task[]; depth: number }> = [];
+
+			for (const node of nodes) {
+				result.push(node);
+
+				// Only show children if parent is expanded
+				if (expandedTasks.has(node.task.id)) {
+					const childNodes = node.children.map((child) => addTaskToTree(child, node.depth + 1));
+					result.push(...flattenTree(childNodes));
+				}
+			}
+
+			return result;
+		}
+
+		return flattenTree(rootTasks.map((task) => addTaskToTree(task)));
 	}
 
-	// Save to localStorage
-	$effect(() => {
-		if (typeof localStorage !== 'undefined') {
-			localStorage.setItem(KEY, JSON.stringify(todos));
-		}
-	});
+	const taskTree = $derived(buildTaskTree());
 
-	// Build a flat, ordered tree view (pre-order), honoring current array order
-	function buildOrderedRows(list: Todo[]): Row[] {
-		const byParent = new Map<string | null, Todo[]>();
-		for (const t of list) {
-			const pid = t.parentId ?? null;
-			if (!byParent.has(pid)) byParent.set(pid, []);
-			byParent.get(pid)!.push(t);
-		}
-		const out: Row[] = [];
-		function dfs(pid: string | null, depth: number) {
-			const kids = byParent.get(pid);
-			if (!kids) return;
-			for (let i = 0; i < kids.length; i++) {
-				const k = kids[i];
-				out.push({
-					todo: k,
-					depth,
-					index: depth > 0 ? i + 1 : null
-				});
-				dfs(k.id, depth + 1);
-			}
-		}
-		dfs(null, 0);
-		return out;
-	}
-
-	const ordered = $derived(buildOrderedRows(todos));
-
-	const visible = $derived(
-		ordered.filter(({ todo }) => {
+	const filteredTasks = $derived(
+		taskTree.filter(({ task }) => {
 			if (filter === 'all') return true;
-			if (filter === 'active') return !todo.done;
-			return todo.done;
+			if (filter === 'active') return !task.completed;
+			return task.completed;
 		})
 	);
 
-	const remaining = $derived(todos.filter((t) => !t.done).length);
+	const activeTasks = $derived(tasks.filter((t) => !t.completed));
 
-	function addTodo() {
-		const title = newTitle.trim();
-		if (!title) return;
-		todos.unshift({
+	async function addTask() {
+		const text = newTaskText.trim();
+		if (!text || !auth.user) return;
+
+		const newTask: Task = {
 			id: crypto.randomUUID(),
-			title,
-			done: false,
-			parentId: null
-		});
-		newTitle = '';
+			text,
+			completed: false,
+			dueDate: null,
+			parentId: null,
+			userId: auth.user.id,
+			createdAt: new Date(),
+			updatedAt: new Date()
+		};
+
+		tasks = [newTask, ...tasks];
+		newTaskText = '';
+
+		// TODO: Save to database
 	}
 
-	// Move item after a target in the flat array (preserves relative order)
-	function moveAfter(itemId: string, afterId: string) {
-		if (itemId === afterId) return;
-		const from = todos.findIndex((x) => x.id === itemId);
-		const to = todos.findIndex((x) => x.id === afterId);
-		if (from === -1 || to === -1) return;
-		const [item] = todos.splice(from, 1);
-		const insertAt = to < from ? to + 1 : to + 1;
-		todos.splice(insertAt, 0, item);
-	}
+	function toggleTask(id: string) {
+		const task = tasks.find((t) => t.id === id);
+		if (!task) return;
 
-	// Subtree helpers
-	function collectSubtreeIds(id: string): Set<string> {
-		const set = new Set<string>();
-		set.add(id);
-		const childrenByParent = new Map<string, Todo[]>();
-		for (const t of todos) {
-			if (t.parentId) {
-				if (!childrenByParent.has(t.parentId)) {
-					childrenByParent.set(t.parentId, []);
-				}
-				childrenByParent.get(t.parentId)!.push(t);
+		task.completed = !task.completed;
+		task.updatedAt = new Date();
+
+		// Cascade to children
+		function cascadeComplete(taskId: string, completed: boolean) {
+			const children = tasks.filter((t) => t.parentId === taskId);
+			for (const child of children) {
+				child.completed = completed;
+				child.updatedAt = new Date();
+				cascadeComplete(child.id, completed);
 			}
 		}
-		const stack = [id];
-		while (stack.length) {
-			const cur = stack.pop()!;
-			const kids = childrenByParent.get(cur);
-			if (!kids) continue;
-			for (const k of kids) {
-				if (!set.has(k.id)) {
-					set.add(k.id);
-					stack.push(k.id);
-				}
-			}
-		}
-		return set;
+
+		cascadeComplete(id, task.completed);
+		tasks = [...tasks];
+
+		// TODO: Save to database
 	}
 
-	function removeTodoCascade(id: string) {
-		const toRemove = collectSubtreeIds(id);
-		todos = todos.filter((t) => !toRemove.has(t.id));
+	function editTask(id: string, text: string) {
+		const task = tasks.find((t) => t.id === id);
+		if (!task) return;
+
+		task.text = text;
+		task.updatedAt = new Date();
+		tasks = [...tasks];
+
+		// TODO: Save to database
+	}
+
+	function deleteTask(id: string) {
+		function collectTaskIds(taskId: string): string[] {
+			const children = tasks.filter((t) => t.parentId === taskId);
+			const ids = [taskId];
+			for (const child of children) {
+				ids.push(...collectTaskIds(child.id));
+			}
+			return ids;
+		}
+
+		const idsToDelete = collectTaskIds(id);
+		tasks = tasks.filter((t) => !idsToDelete.includes(t.id));
+
+		// TODO: Save to database
+	}
+
+	function promoteTask(id: string) {
+		const task = tasks.find((t) => t.id === id);
+		if (!task || !task.parentId) return;
+
+		const parent = tasks.find((t) => t.id === task.parentId);
+		task.parentId = parent?.parentId || null;
+		task.updatedAt = new Date();
+		tasks = [...tasks];
+
+		// TODO: Save to database
+	}
+
+	function demoteTask(id: string) {
+		const taskIndex = tasks.findIndex((t) => t.id === id);
+		if (taskIndex === -1) return;
+
+		const task = tasks[taskIndex];
+
+		// Find previous sibling at same level
+		let prevSibling: Task | null = null;
+		for (let i = taskIndex - 1; i >= 0; i--) {
+			const candidate = tasks[i];
+			if (candidate.parentId === task.parentId) {
+				prevSibling = candidate;
+				break;
+			}
+		}
+
+		if (prevSibling) {
+			task.parentId = prevSibling.id;
+			task.updatedAt = new Date();
+
+			// Ensure parent is expanded
+			expandedTasks.add(prevSibling.id);
+
+			tasks = [...tasks];
+		}
+
+		// TODO: Save to database
+	}
+
+	function toggleExpand(id: string) {
+		if (expandedTasks.has(id)) {
+			expandedTasks.delete(id);
+		} else {
+			expandedTasks.add(id);
+		}
+		expandedTasks = new Set(expandedTasks);
 	}
 
 	function clearCompleted() {
-		// remove every done item and its descendants
-		const removeSet = new Set<string>();
-		for (const t of todos) {
-			if (t.done) {
-				for (const x of collectSubtreeIds(t.id)) removeSet.add(x);
+		const completedIds = new Set<string>();
+
+		function collectCompleted(taskId: string) {
+			const task = tasks.find((t) => t.id === taskId);
+			if (task?.completed) {
+				completedIds.add(taskId);
+				// Add all children too
+				tasks
+					.filter((t) => t.parentId === taskId)
+					.forEach((child) => {
+						collectCompleted(child.id);
+					});
 			}
 		}
-		if (removeSet.size === 0) return;
-		todos = todos.filter((t) => !removeSet.has(t.id));
+
+		tasks.forEach((task) => {
+			if (task.completed) collectCompleted(task.id);
+		});
+
+		tasks = tasks.filter((t) => !completedIds.has(t.id));
+
+		// TODO: Save to database
 	}
 
-	// Editing
-	function startEdit(id: string, el: HTMLSpanElement) {
-		editing = id;
-		el.contentEditable = 'true';
-		el.focus();
-
-		const range = document.createRange();
-		range.selectNodeContents(el);
-		const sel = window.getSelection();
-		sel?.removeAllRanges();
-		sel?.addRange(range);
-	}
-
-	function finishEdit(id: string, el: HTMLSpanElement) {
-		const todo = todos.find((t) => t.id === id);
-		if (!todo) return;
-		const next = el.textContent?.trim() ?? '';
-		if (!next) {
-			removeTodoCascade(id);
-		} else {
-			todo.title = next;
-		}
-		el.contentEditable = 'false';
-		editing = null;
-	}
-
-	function cancelEdit(id: string, el: HTMLSpanElement) {
-		const todo = todos.find((t) => t.id === id);
-		if (todo) el.textContent = todo.title;
-		el.contentEditable = 'false';
-		editing = null;
-	}
-
-	// Prev visible that's NOT a descendant of the given id
-	function findPrevNonDescendant(id: string): Todo | null {
-		const set = collectSubtreeIds(id);
-		const idx = visible.findIndex((r) => r.todo.id === id);
-		for (let i = idx - 1; i >= 0; i--) {
-			const cand = visible[i].todo;
-			if (!set.has(cand.id)) return cand;
-		}
-		return null;
-	}
-
-	// Promote/Demote
-	function promote(id: string) {
-		const t = todos.find((x) => x.id === id);
-		if (!t) return;
-		if (t.parentId === null) return; // already root
-		const parent = todos.find((x) => x.id === t.parentId);
-		t.parentId = parent ? parent.parentId : null;
-	}
-
-	function demoteUnderPrev(id: string) {
-		const t = todos.find((x) => x.id === id);
-		if (!t) return;
-		const prev = findPrevNonDescendant(id);
-		if (!prev) return; // no other todos or only descendants above
-		t.parentId = prev.id;
-		moveAfter(id, prev.id);
-	}
-
-	// Gestures (swipe)
-	function onPointerDown(id: string, e: PointerEvent) {
-		if (editing === id) return; // don't drag while editing
-		dragId = id;
-		swiping = false;
-		dx = 0;
-		startX = e.clientX;
-		startY = e.clientY;
-		(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-	}
-
-	function onPointerMove(id: string, e: PointerEvent) {
-		if (dragId !== id) return;
-		const mx = e.clientX - startX;
-		const my = e.clientY - startY;
-		if (!swiping) {
-			if (Math.abs(mx) > 6 && Math.abs(mx) > Math.abs(my)) {
-				swiping = true;
-			} else {
-				return;
-			}
-		}
-		dx = mx;
-	}
-
-	function commitSwipe(id: string, dist: number) {
-		if (dist <= -SWIPE_THRESHOLD) {
-			// Delete row + subtree
-			removeTodoCascade(id);
-		} else if (dist >= SWIPE_THRESHOLD) {
-			// Make child under nearest previous visible (non-descendant), if any
-			const prev = findPrevNonDescendant(id);
-			if (prev) {
-				const t = todos.find((x) => x.id === id);
-				if (t) {
-					t.parentId = prev.id;
-					moveAfter(id, prev.id);
-				}
-			}
-			// If no prev, snap back (no-op)
-		}
-	}
-
-	function endSwipe(id: string, e: PointerEvent) {
-		if (dragId !== id) return;
-		(e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
-		if (swiping) commitSwipe(id, dx);
-		// Reset gesture state; snapping handled by inline transition
-		dragId = null;
-		dx = 0;
-		swiping = false;
-	}
+	// Initialize with expanded root tasks
+	$effect(() => {
+		tasks
+			.filter((t) => !t.parentId)
+			.forEach((task) => {
+				expandedTasks.add(task.id);
+			});
+	});
 </script>
 
-<Card class="space-y-4">
-	<Input
-		bind:value={newTitle}
-		placeholder="Add todo..."
-		onkeydown={(e) => e.key === 'Enter' && addTodo()}
-		autofocus
-	/>
+<div class="mx-auto max-w-2xl space-y-6">
+	<div class="rounded-lg border border-gray-800 bg-gray-950 p-6">
+		<h1 class="mb-6 text-2xl font-bold text-white">Todo List</h1>
 
-	<div class="flex items-center justify-between">
-		<div class="flex gap-1">
-			{#each ['all', 'active', 'done'] as f}
-				<Button size="sm" variant={filter === f ? 'primary' : 'ghost'} onclick={() => (filter = f)}>
-					{f}
-				</Button>
-			{/each}
-		</div>
-		<span class="text-xs text-zinc-400">{remaining} left</span>
-	</div>
-
-	<ul class="space-y-2">
-		{#each visible as { todo, depth, index } (todo.id)}
-			{@const isEditing = editing === todo.id}
-			{@const isDragging = dragId === todo.id}
-			{@const willDelete = isDragging && dx <= -SWIPE_THRESHOLD}
-			{@const willIndent = isDragging && dx >= SWIPE_THRESHOLD}
-
-			<li
-				class="group relative flex items-center gap-2 rounded border
-          border-zinc-800 bg-zinc-950 p-2
-          {isDragging ? 'select-none' : ''}
-          {willDelete ? 'ring-1 ring-red-900/60' : ''}
-          {willIndent ? 'ring-1 ring-emerald-900/60' : ''}"
-				style={`transform: ${isDragging ? `translateX(${dx}px)` : 'translateX(0px)'}; transition: ${
-					isDragging ? 'none' : 'transform 150ms ease-out'
-				}; touch-action: pan-y;`}
-				onpointerdown={(e) => onPointerDown(todo.id, e)}
-				onpointermove={(e) => onPointerMove(todo.id, e)}
-				onpointerup={(e) => endSwipe(todo.id, e)}
-				onpointercancel={(e) => endSwipe(todo.id, e)}
+		<!-- Add new task -->
+		<div class="mb-6 flex gap-2">
+			<input
+				bind:value={newTaskText}
+				onkeydown={(e) => e.key === 'Enter' && addTask()}
+				placeholder="What needs to be done?"
+				class="flex-1 rounded-lg border border-gray-700 bg-gray-900 px-4 py-2 text-white placeholder-gray-400 focus:border-blue-500 focus:outline-none"
+			/>
+			<button
+				onclick={addTask}
+				disabled={!newTaskText.trim()}
+				class="rounded-lg bg-blue-600 px-4 py-2 font-medium text-white transition-colors hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
 			>
-				<!-- Row body with indentation, connectors (shoulder), and numbering -->
-				<div
-					class="relative flex flex-1 items-center gap-2"
-					style={`padding-left: ${depth * 16}px;`}
-				>
-					{#if depth > 0}
-						<!-- Vertical shoulder under parent -->
-						<span
-							class="pointer-events-none absolute top-0 bottom-0 left-2
-                border-l border-zinc-800"
-							aria-hidden="true"
-						/>
-						<!-- Elbow into this row -->
-						<span
-							class="pointer-events-none absolute top-1/2 left-2
-                w-3 -translate-y-1/2 border-t border-zinc-800"
-							aria-hidden="true"
-						/>
-						<!-- Sibling numbering -->
-						<span
-							class="w-6 shrink-0 text-right text-[11px] leading-none
-                text-zinc-500"
-							title="Child index"
-						>
-							{index}.
-						</span>
-					{/if}
+				<Plus size={20} />
+			</button>
+		</div>
 
-					<Checkbox bind:checked={todo.done} ariaLabel="Mark complete" class="shrink-0" />
-
-					<span
-						class="flex-1 text-sm
-              {todo.done ? 'text-zinc-500 line-through' : 'text-zinc-100'}
-              {isEditing
-							? 'rounded bg-transparent px-1 caret-zinc-200 outline-none focus-visible:ring-1 focus-visible:ring-zinc-700 focus-visible:outline-none'
-							: 'cursor-pointer'}"
-						onclick={(e) => !isEditing && startEdit(todo.id, e.currentTarget)}
-						onkeydown={(e) => {
-							if (!isEditing) return;
-							if (e.key === 'Enter') {
-								e.preventDefault();
-								finishEdit(todo.id, e.currentTarget);
-							} else if (e.key === 'Escape') {
-								e.preventDefault();
-								cancelEdit(todo.id, e.currentTarget);
-							}
-						}}
-						onblur={(e) => isEditing && cancelEdit(todo.id, e.currentTarget)}
-						title={isEditing ? 'Editing' : 'Edit'}
+		<!-- Filter tabs -->
+		<div class="mb-6 flex items-center justify-between">
+			<div class="flex gap-1">
+				{#each [{ value: 'all', label: 'All' }, { value: 'active', label: 'Active' }, { value: 'completed', label: 'Completed' }] as filterOption}
+					<button
+						onclick={() => (filter = filterOption.value)}
+						class="rounded px-3 py-1 text-sm font-medium transition-colors
+							{filter === filterOption.value ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-white'}"
 					>
-						{todo.title}
-					</span>
+						{filterOption.label}
+					</button>
+				{/each}
+			</div>
 
-					<div class="flex items-center gap-1">
-						<!-- Promote/Demote -->
-						{#if todo.parentId !== null}
-							<!-- Can promote (outdent) -->
-							<Button
-								size="sm"
-								variant="ghost"
-								class="h-7 px-2 text-zinc-400 opacity-0
-                  group-hover:opacity-100 hover:text-zinc-200"
-								ariaLabel="Promote todo (outdent)"
-								title="Promote (outdent)"
-								onclick={() => promote(todo.id)}
-							>
-								Promote
-							</Button>
-						{:else}
-							{@const prevElig = findPrevNonDescendant(todo.id)}
-							<Button
-								size="sm"
-								variant="ghost"
-								class="h-7 px-2 text-zinc-400 opacity-0
-                  group-hover:opacity-100 hover:text-zinc-200
-                  disabled:opacity-30"
-								ariaLabel="Demote todo under previous item"
-								title="Demote (indent under previous)"
-								disabled={!prevElig}
-								onclick={() => demoteUnderPrev(todo.id)}
-							>
-								Demote
-							</Button>
-						{/if}
+			<span class="text-sm text-gray-400">
+				{activeTasks.length} active
+			</span>
+		</div>
 
-						<!-- Delete -->
-						<Button
-							size="sm"
-							variant="ghost"
-							class="h-7 w-7 p-0 text-zinc-400 opacity-0
-                group-hover:opacity-100 hover:text-red-400"
-							ariaLabel="Delete todo"
-							title="Delete"
-							onclick={() => removeTodoCascade(todo.id)}
-						>
-							<Trash2Icon size={14} />
-						</Button>
+		<!-- Task list -->
+		<div class="space-y-2">
+			{#each filteredTasks as { task, children, depth } (task.id)}
+				<TodoItem
+					{task}
+					{depth}
+					isExpanded={expandedTasks.has(task.id)}
+					hasChildren={children.length > 0}
+					onToggle={toggleTask}
+					onEdit={editTask}
+					onDelete={deleteTask}
+					onPromote={promoteTask}
+					onDemote={demoteTask}
+					onToggleExpand={toggleExpand}
+				/>
+			{:else}
+				<div class="text-center py-12 text-gray-400">
+					<div class="text-lg mb-2">No tasks found</div>
+					<div class="text-sm">
+						{filter === 'all' ? 'Add your first task above' : `No ${filter} tasks`}
 					</div>
 				</div>
-			</li>
-		{:else}
-			<li class="py-4 text-center text-sm text-zinc-500">No todos yet</li>
-		{/each}
-	</ul>
-
-	{#if todos.some((t) => t.done)}
-		<div class="flex justify-end">
-			<Button size="sm" variant="danger" onclick={clearCompleted}>Clear completed</Button>
+			{/each}
 		</div>
-	{/if}
-</Card>
+
+		<!-- Clear completed -->
+		{#if tasks.some((t) => t.completed)}
+			<div class="mt-6 flex justify-end">
+				<button
+					onclick={clearCompleted}
+					class="text-sm font-medium text-red-400 transition-colors hover:text-red-300"
+				>
+					Clear completed
+				</button>
+			</div>
+		{/if}
+	</div>
+</div>

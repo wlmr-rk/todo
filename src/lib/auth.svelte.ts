@@ -4,11 +4,12 @@ class AuthStore {
   user = $state(null);
   loading = $state(true);
 
-  async initialize() {
-    // Get initial session
-    const { data: { session } } = await supabase.auth.getSession();
-    this.user = session?.user ?? null;
-    this.loading = false;
+  initialize() {
+    // Get initial session async
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      this.user = session?.user ?? null;
+      this.loading = false;
+    });
 
     // Listen for auth changes
     const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {

@@ -1,4 +1,5 @@
 <script>
+	import TodoList from '$lib/components/TodoList.svelte';
 	import { supabase } from '$lib/supabaseClient';
 	import { Github } from 'lucide-svelte';
 	import { getContext } from 'svelte';
@@ -21,8 +22,7 @@
 <main class="flex min-h-screen items-center justify-center bg-gray-900 text-white">
 	{#if auth.user}
 		<div class="text-center">
-			<h1 class="mb-4 text-2xl font-bold">You're authenticated!</h1>
-			<p class="mb-4">Welcome, {auth.user.user_metadata.full_name}</p>
+			<TodoList />
 			<button onclick={signOut} class="rounded bg-red-600 px-4 py-2 hover:bg-red-700">
 				Sign Out
 			</button>
