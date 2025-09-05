@@ -6,9 +6,9 @@ export const tasks = pgTable('tasks', {
   id: text('id').primaryKey().$default(() => crypto.randomUUID()),
   text: text('text').notNull(),
   completed: boolean('completed').default(false).notNull(),
-  dueDate: timestamp('due_date', { withTimezone: true }),
-  parentId: text('parent_id'),
-  userId: uuid('user_id').notNull(), // references auth.users(id)
+  due_date: timestamp('due_date', { withTimezone: true }),
+  parent_id: text('parent_id'),
+  user_id: uuid('user_id').notNull(), // references auth.users(id)
   createdAt: timestamp('created_at', { withTimezone: true }).default(sql`now()`).notNull(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).default(sql`now()`).notNull()
 });

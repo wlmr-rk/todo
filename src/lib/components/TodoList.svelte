@@ -1,6 +1,6 @@
-<!-- TodoList.svelte -->
 <script lang="ts">
 	import type { Task } from '$lib/server/db/schema';
+	import { supabase } from '$lib/supabaseClient';
 	import { Plus } from 'lucide-svelte';
 	import { getContext } from 'svelte';
 	import TodoItem from './TodoItem.svelte';
@@ -12,6 +12,28 @@
 	let filter = $state<'all' | 'active' | 'completed'>('all');
 	let expandedTasks = $state<Set<string>>(new Set());
 
+	// Fetch initial tasks from the database
+	$effect(() => {
+		if (auth.user) {
+			fetchTasks();
+		}
+	});
+
+	async function fetchTasks() {
+		if (!auth.user) return;
+		const { data, error } = await supabase
+			.from('tasks')
+			.select('*')
+			.eq('user_id', auth.user.id)
+			.order('created_at', { ascending: false });
+
+		if (error) {
+			console.error('Error fetching tasks:', error);
+		} else {
+			tasks = data;
+		}
+	}
+
 	// Build hierarchical tree structure
 	function buildTaskTree(): Array<{ task: Task; children: Task[]; depth: number }> {
 		const taskMap = new Map(tasks.map((task) => [task.id, task]));
@@ -19,20 +41,18 @@
 
 		function addTaskToTree(task: Task, depth = 0): { task: Task; children: Task[]; depth: number } {
 			const children = tasks
-				.filter((t) => t.parentId === task.id)
+				.filter((t) => t.parent_id === task.id)
 				.map((child) => addTaskToTree(child, depth + 1));
-
 			return { task, children: children.map((c) => c.task), depth };
 		}
 
 		// Get root tasks (no parent)
-		const rootTasks = tasks.filter((task) => !task.parentId);
+		const rootTasks = tasks.filter((task) => !task.parent_id);
 
 		function flattenTree(
 			nodes: Array<{ task: Task; children: Task[]; depth: number }>
 		): Array<{ task: Task; children: Task[]; depth: number }> {
 			const result: Array<{ task: Task; children: Task[]; depth: number }> = [];
-
 			for (const node of nodes) {
 				result.push(node);
 
@@ -50,7 +70,6 @@
 	}
 
 	const taskTree = $derived(buildTaskTree());
-
 	const filteredTasks = $derived(
 		taskTree.filter(({ task }) => {
 			if (filter === 'all') return true;
@@ -58,67 +77,98 @@
 			return task.completed;
 		})
 	);
-
 	const activeTasks = $derived(tasks.filter((t) => !t.completed));
 
 	async function addTask() {
 		const text = newTaskText.trim();
 		if (!text || !auth.user) return;
 
-		const newTask: Task = {
-			id: crypto.randomUUID(),
+		const newTask: Omit<Task, 'id' | 'createdAt' | 'updatedAt'> & {
+			id?: string;
+			createdAt?: Date;
+			updatedAt?: Date;
+		} = {
 			text,
 			completed: false,
-			dueDate: null,
-			parentId: null,
-			userId: auth.user.id,
-			createdAt: new Date(),
-			updatedAt: new Date()
+			due_date: null,
+			parent_id: null,
+			user_id: auth.user.id
 		};
 
-		tasks = [newTask, ...tasks];
-		newTaskText = '';
+		const { data, error } = await supabase.from('tasks').insert(newTask).select();
 
-		// TODO: Save to database
+		if (error) {
+			console.error('Error adding task:', error);
+		} else if (data) {
+			tasks = [data[0], ...tasks];
+			newTaskText = '';
+		}
 	}
 
-	function toggleTask(id: string) {
+	async function toggleTask(id: string) {
 		const task = tasks.find((t) => t.id === id);
 		if (!task) return;
 
-		task.completed = !task.completed;
-		task.updatedAt = new Date();
+		const newCompletedState = !task.completed;
+		const newUpdatedAt = new Date();
 
-		// Cascade to children
+		// Optimistic UI update
+		const originalTasks = [...tasks];
+		task.completed = newCompletedState;
+		task.updatedAt = newUpdatedAt;
+
+		// Cascade to children locally for immediate feedback
 		function cascadeComplete(taskId: string, completed: boolean) {
-			const children = tasks.filter((t) => t.parentId === taskId);
+			const children = tasks.filter((t) => t.parent_id === taskId);
 			for (const child of children) {
 				child.completed = completed;
-				child.updatedAt = new Date();
+				child.updatedAt = newUpdatedAt;
 				cascadeComplete(child.id, completed);
 			}
 		}
-
-		cascadeComplete(id, task.completed);
+		cascadeComplete(id, newCompletedState);
 		tasks = [...tasks];
 
-		// TODO: Save to database
+		// Update database
+		const { error } = await supabase
+			.from('tasks')
+			.update({ completed: newCompletedState, updated_at: newUpdatedAt.toISOString() })
+			.eq('id', id);
+
+		if (error) {
+			console.error('Error toggling task:', error);
+			tasks = originalTasks; // Revert on error
+		}
 	}
 
-	function editTask(id: string, text: string) {
+	async function editTask(id: string, text: string) {
 		const task = tasks.find((t) => t.id === id);
 		if (!task) return;
 
+		const newUpdatedAt = new Date();
+		const originalText = task.text;
+
+		// Optimistic UI update
 		task.text = text;
-		task.updatedAt = new Date();
+		task.updatedAt = newUpdatedAt;
 		tasks = [...tasks];
 
-		// TODO: Save to database
+		// Update database
+		const { error } = await supabase
+			.from('tasks')
+			.update({ text, updated_at: newUpdatedAt.toISOString() })
+			.eq('id', id);
+
+		if (error) {
+			console.error('Error editing task:', error);
+			task.text = originalText; // Revert on error
+			tasks = [...tasks];
+		}
 	}
 
-	function deleteTask(id: string) {
+	async function deleteTask(id: string) {
 		function collectTaskIds(taskId: string): string[] {
-			const children = tasks.filter((t) => t.parentId === taskId);
+			const children = tasks.filter((t) => t.parent_id === taskId);
 			const ids = [taskId];
 			for (const child of children) {
 				ids.push(...collectTaskIds(child.id));
@@ -127,24 +177,49 @@
 		}
 
 		const idsToDelete = collectTaskIds(id);
+		const originalTasks = [...tasks];
+
+		// Optimistic UI update
 		tasks = tasks.filter((t) => !idsToDelete.includes(t.id));
 
-		// TODO: Save to database
+		// Update database
+		const { error } = await supabase.from('tasks').delete().in('id', idsToDelete);
+
+		if (error) {
+			console.error('Error deleting task:', error);
+			tasks = originalTasks; // Revert on error
+		}
 	}
 
-	function promoteTask(id: string) {
+	async function promoteTask(id: string) {
 		const task = tasks.find((t) => t.id === id);
-		if (!task || !task.parentId) return;
+		if (!task || !task.parent_id) return;
 
-		const parent = tasks.find((t) => t.id === task.parentId);
-		task.parentId = parent?.parentId || null;
-		task.updatedAt = new Date();
+		const parent = tasks.find((t) => t.id === task.parent_id);
+		const newParentId = parent?.parent_id || null;
+		const newUpdatedAt = new Date();
+
+		const originalParentId = task.parent_id;
+
+		// Optimistic UI update
+		task.parent_id = newParentId;
+		task.updatedAt = newUpdatedAt;
 		tasks = [...tasks];
 
-		// TODO: Save to database
+		// Update database
+		const { error } = await supabase
+			.from('tasks')
+			.update({ parent_id: newParentId, updated_at: newUpdatedAt.toISOString() })
+			.eq('id', id);
+
+		if (error) {
+			console.error('Error promoting task:', error);
+			task.parent_id = originalParentId; // Revert on error
+			tasks = [...tasks];
+		}
 	}
 
-	function demoteTask(id: string) {
+	async function demoteTask(id: string) {
 		const taskIndex = tasks.findIndex((t) => t.id === id);
 		if (taskIndex === -1) return;
 
@@ -154,23 +229,35 @@
 		let prevSibling: Task | null = null;
 		for (let i = taskIndex - 1; i >= 0; i--) {
 			const candidate = tasks[i];
-			if (candidate.parentId === task.parentId) {
+			if (candidate.parent_id === task.parent_id) {
 				prevSibling = candidate;
 				break;
 			}
 		}
 
 		if (prevSibling) {
-			task.parentId = prevSibling.id;
-			task.updatedAt = new Date();
+			const newParentId = prevSibling.id;
+			const newUpdatedAt = new Date();
+			const originalParentId = task.parent_id;
 
-			// Ensure parent is expanded
-			expandedTasks.add(prevSibling.id);
-
+			// Optimistic UI update
+			task.parent_id = newParentId;
+			task.updatedAt = newUpdatedAt;
+			expandedTasks.add(newParentId);
 			tasks = [...tasks];
-		}
 
-		// TODO: Save to database
+			// Update database
+			const { error } = await supabase
+				.from('tasks')
+				.update({ parent_id: newParentId, updated_at: newUpdatedAt.toISOString() })
+				.eq('id', id);
+
+			if (error) {
+				console.error('Error demoting task:', error);
+				task.parent_id = originalParentId; // Revert on error
+				tasks = [...tasks];
+			}
+		}
 	}
 
 	function toggleExpand(id: string) {
@@ -182,16 +269,15 @@
 		expandedTasks = new Set(expandedTasks);
 	}
 
-	function clearCompleted() {
+	async function clearCompleted() {
 		const completedIds = new Set<string>();
-
 		function collectCompleted(taskId: string) {
 			const task = tasks.find((t) => t.id === taskId);
 			if (task?.completed) {
 				completedIds.add(taskId);
 				// Add all children too
 				tasks
-					.filter((t) => t.parentId === taskId)
+					.filter((t) => t.parent_id === taskId)
 					.forEach((child) => {
 						collectCompleted(child.id);
 					});
@@ -202,15 +288,24 @@
 			if (task.completed) collectCompleted(task.id);
 		});
 
+		const originalTasks = [...tasks];
+
+		// Optimistic UI update
 		tasks = tasks.filter((t) => !completedIds.has(t.id));
 
-		// TODO: Save to database
+		// Update database
+		const { error } = await supabase.from('tasks').delete().in('id', Array.from(completedIds));
+
+		if (error) {
+			console.error('Error clearing completed tasks:', error);
+			tasks = originalTasks; // Revert on error
+		}
 	}
 
 	// Initialize with expanded root tasks
 	$effect(() => {
 		tasks
-			.filter((t) => !t.parentId)
+			.filter((t) => !t.parent_id)
 			.forEach((task) => {
 				expandedTasks.add(task.id);
 			});
@@ -221,7 +316,6 @@
 	<div class="rounded-lg border border-gray-800 bg-gray-950 p-6">
 		<h1 class="mb-6 text-2xl font-bold text-white">Todo List</h1>
 
-		<!-- Add new task -->
 		<div class="mb-6 flex gap-2">
 			<input
 				bind:value={newTaskText}
@@ -238,7 +332,6 @@
 			</button>
 		</div>
 
-		<!-- Filter tabs -->
 		<div class="mb-6 flex items-center justify-between">
 			<div class="flex gap-1">
 				{#each [{ value: 'all', label: 'All' }, { value: 'active', label: 'Active' }, { value: 'completed', label: 'Completed' }] as filterOption}
@@ -257,7 +350,6 @@
 			</span>
 		</div>
 
-		<!-- Task list -->
 		<div class="space-y-2">
 			{#each filteredTasks as { task, children, depth } (task.id)}
 				<TodoItem
@@ -282,7 +374,6 @@
 			{/each}
 		</div>
 
-		<!-- Clear completed -->
 		{#if tasks.some((t) => t.completed)}
 			<div class="mt-6 flex justify-end">
 				<button

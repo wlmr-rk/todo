@@ -114,9 +114,9 @@
 	</div>
 
 	<!-- Due date -->
-	{#if task.dueDate}
+	{#if task.due_date}
 		<span class="text-xs text-gray-500">
-			{new Date(task.dueDate).toLocaleDateString()}
+			{new Date(task.due_date).toLocaleDateString()}
 		</span>
 	{/if}
 
