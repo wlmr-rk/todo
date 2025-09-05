@@ -4,22 +4,19 @@ class AuthStore {
   user = $state(null);
   loading = $state(true);
 
-  constructor() {
-    $effect(() => {
-      // Get initial session
-      supabase.auth.getSession().then(({ data: { session } }) => {
-        this.user = session?.user ?? null;
-        this.loading = false;
-      });
+  async initialize() {
+    // Get initial session
+    const { data: { session } } = await supabase.auth.getSession();
+    this.user = session?.user ?? null;
+    this.loading = false;
 
-      // Listen for auth changes
-      const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
-        this.user = session?.user ?? null;
-        this.loading = false;
-      });
-
-      return () => subscription.unsubscribe();
+    // Listen for auth changes
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
+      this.user = session?.user ?? null;
+      this.loading = false;
     });
+
+    return () => subscription.unsubscribe();
   }
 }
 

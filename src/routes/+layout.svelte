@@ -5,6 +5,10 @@
 
 	let { children } = $props();
 	setContext('auth', auth);
+
+	$effect(() => {
+		return auth.initialize();
+	});
 </script>
 
 {#if auth.loading}
